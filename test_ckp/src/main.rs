@@ -90,12 +90,9 @@ mod app {
     // pub mod debug;
     pub mod engine;
     pub mod gpio;
-    pub mod injection;
-    pub mod ignition;
     pub mod logging;
     pub mod memory;
     pub mod util;
-    pub mod webserial;
     pub mod tasks;
 
 
@@ -120,12 +117,6 @@ mod app {
         stepper_pins: StepperMapping,
         adc_transfer: DMATransfer,
 
-        // USB:
-        // TODO: se puede reducir implementando los channels de RTIC, de paso fixeo el bug de las tablas
-        usb_cdc: SerialPort<'static, UsbBusType, [u8; 128], [u8; 512]>,
-        usb_web: WebUsb<UsbBusType>,
-        cdc_sender: Sender<'static, SerialMessage, CDC_BUFF_CAPACITY>,
-
         // core:
         spi_lock: bool,
         crc: Crc32,
@@ -147,8 +138,6 @@ mod app {
     #[local]
     struct Local {
         // core
-        usb_dev: UsbDevice<'static, UsbBusType>,
-        cdc_input_buffer: ArrayVec<u8, 128>,
         watchdog: IndependentWatchdog,
         adc_buffer: Option<&'static mut [u16; 6]>,
 
@@ -163,19 +152,13 @@ mod app {
         state: bool,
         state2: bool,
 
-        // WebSerial:
-        table_sender: Sender<'static, SerialMessage, CDC_BUFF_CAPACITY>,
-        real_time_sender: Sender<'static, SerialMessage, CDC_BUFF_CAPACITY>,
-        pmic_sender: Sender<'static, SerialMessage, CDC_BUFF_CAPACITY>,
-        engine_sender: Sender<'static, SerialMessage, CDC_BUFF_CAPACITY>,
-
         // ignition,
         ign_channel_1: bool,
     }
 
     const CDC_BUFF_CAPACITY: usize = 30;
 
-    #[init(local = [USB_BUS: Option < UsbBusAllocator < UsbBusType >> = None])]
+    #[init()]
     fn init(mut cx: init::Context) -> (Shared, Local) {
         // Setup clocks
         //let mut flash = cx.device.FLASH.constrain();
@@ -307,19 +290,6 @@ mod app {
 
         efi_cfg.read(&mut flash, &flash_info, &mut crc);
 
-        injection_setup(&mut table, &mut flash, &flash_info, &mut crc);
-
-        // REMOVE: solo lo estoy hardcodeando aca para probar el AlphaN
-        _efi_status.rpm = 1500;
-
-        calculate_time_isr(&mut _efi_status, &efi_cfg, &mut table);
-
-        host::debug!("AirFlow {:?} g/s", _efi_status.injection.air_flow);
-        host::debug!("AF/r {:?}", _efi_status.injection.targetAFR);
-        host::debug!("Base Fuel {:?} cm3", _efi_status.injection.base_fuel);
-        host::debug!("Base Air {:?} cm3", _efi_status.injection.base_air);
-        host::debug!("Time {:?} mS", _efi_status.injection.injection_bank_1_time);
-
         let mut sensors = SensorValues::new();
 
         let mut spi_lock = false;
@@ -329,48 +299,12 @@ mod app {
 
         let mut ckp_status = VRStatus::new();
 
-        // Init USB
-        let usb = USB {
-            usb_global: device.OTG_FS_GLOBAL,
-            usb_device: device.OTG_FS_DEVICE,
-            usb_pwrclk: device.OTG_FS_PWRCLK,
-            pin_dm: gpio_config.usb_dp,
-            pin_dp: gpio_config.usb_dm,
-            hclk: _clocks.hclk(),
-        };
-
-        static mut EP_MEMORY: [u32; 1024] = [0; 1024];
-        static mut __USB_TX: [u8; 512] = [0; 512];
-        static mut __USB_RX: [u8; 128] = [0; 128];
-        host::debug!("init usb");
-        let usb_bus = cx.local.USB_BUS;
-        unsafe {
-            *usb_bus = Some(otg_fs::UsbBus::new(usb, &mut EP_MEMORY));
-        }
-
-        let usb_cdc = unsafe {
-            SerialPort::new_with_store(usb_bus.as_ref().unwrap(), __USB_RX, __USB_TX)
-        };
-        let usb_web = WebUsb::new(
-            usb_bus.as_ref().unwrap(),
-            url_scheme::HTTPS,
-            "tuner.openefi.tech",
-        );
-
-        let usb_dev = webserial::new_device(usb_bus.as_ref().unwrap());
-
-        let cdc_buff = ArrayVec::<u8, 128>::new();
-
 
         // DEMO
         // Schedule the blinking task
         blink::spawn().ok();
         blink2::spawn().ok();
 
-        let (cdc_sender, cdc_receiver) = make_channel!(SerialMessage, CDC_BUFF_CAPACITY);
-
-        cdc_receiver::spawn(cdc_receiver).unwrap();
-        polling_adc::spawn().unwrap();
 
         let mut watchdog = IndependentWatchdog::new(device.IWDG);
         // se puede desactivar en debug
@@ -384,11 +318,6 @@ mod app {
             timer3,
             timer4,
             timer13,
-
-            // USB
-            usb_cdc,
-            usb_web,
-            cdc_sender: cdc_sender.clone(),
 
             // GPIO:
             led: gpio_config.led,
@@ -416,18 +345,9 @@ mod app {
             ckp: ckp_status,
             ignition_running: false,
         }, Local {
-            // USB
-            usb_dev,
-            cdc_input_buffer: cdc_buff,
             watchdog,
 
             adc_buffer: adc_second_buffer,
-
-            // Serial
-            table_sender: cdc_sender.clone(),
-            real_time_sender: cdc_sender.clone(),
-            pmic_sender: cdc_sender.clone(),
-            engine_sender: cdc_sender.clone(),
 
             adc,
             ckp,
@@ -538,71 +458,14 @@ mod app {
         ctx.shared.led.lock(|l| l.led_check.set_high());
     }
 
-    #[task(binds = OTG_FS, local = [usb_dev, cdc_input_buffer], shared = [usb_cdc, usb_web, cdc_sender])]
-    fn usb_handler(mut ctx: usb_handler::Context) {
-        let device = ctx.local.usb_dev;
-
-        ctx.shared.usb_cdc.lock(|cdc| {
-            // USB dev poll only in the interrupt handler
-            (ctx.shared.usb_web, ctx.shared.cdc_sender).lock(|web, cdc_sender| {
-                if device.poll(&mut [web, cdc]) {
-                    let mut buf = [0u8; 64];
-
-                    match cdc.read(&mut buf[..]) {
-                        Ok(count) => {
-                            // Push bytes into the buffer
-                            for i in 0..count {
-                                ctx.local.cdc_input_buffer.push(buf[i]);
-                                if ctx.local.cdc_input_buffer.is_full() {
-                                    webserial::process_command(
-                                        ctx.local.cdc_input_buffer.take().into_inner().unwrap(),
-                                        cdc_sender,
-                                    );
-
-                                    ctx.local.cdc_input_buffer.clear();
-                                }
-                            }
-                        }
-                        Err(_) => {}
-                    }
-                }
-            });
-        });
-    }
-
     // Externally defined tasks
     extern "Rust" {
-        // Low-priority task to send back replies via the serial port. , capacity = 30
-        #[task(shared = [usb_cdc], priority = 2)]
-        async fn send_message(
-            ctx: send_message::Context,
-            status: SerialStatus,
-            code: u8,
-            message: SerialMessage,
-        );
-
-        #[task(local = [table_sender], shared = [flash_info, efi_cfg, tables, crc, flash, spi_lock],priority = 1)]
-        async fn table_cdc_callback(ctx: table_cdc_callback::Context, serial_cmd: SerialMessage);
-        #[task(local = [real_time_sender], shared = [efi_status, sensors, crc],priority = 1)]
-        async fn realtime_data_cdc_callback(ctx: realtime_data_cdc_callback::Context, serial_cmd: SerialMessage);
-
-        #[task(local = [pmic_sender], shared = [efi_status, pmic, crc],priority = 1)]
-        async fn pmic_cdc_callback(ctx: pmic_cdc_callback::Context, serial_cmd: SerialMessage);
-
-        #[task(local = [engine_sender], shared = [flash, flash_info, efi_cfg, crc],priority = 1)]
-        async fn engine_cdc_callback(ctx: engine_cdc_callback::Context, serial_cmd: SerialMessage);
 
         // from: https://github.com/noisymime/speeduino/blob/master/speeduino/decoders.ino#L453
         #[task(binds = EXTI9_5, local = [ckp], shared = [led, efi_status, flash_info, efi_cfg, timer, timer3, timer4, ckp, ign_pins], priority = 5)]
         fn ckp_trigger(ctx: ckp_trigger::Context);
         #[task(shared = [efi_cfg, ckp, timer4, efi_status, ignition_running],priority = 3)]
         async fn ckp_checks(ctx: ckp_checks::Context);
-
-        #[task(shared = [efi_cfg, efi_status, ckp, timer4], local = [ign_channel_1],priority = 3)]
-        async fn ignition_checks(ctx: ignition_checks::Context);
-
-        #[task(shared = [efi_cfg, efi_status, ckp, timer3, led],priority = 3)]
-        async fn ignition_trigger(ctx: ignition_trigger::Context, time: i32);
 
         //
         // #[task(
@@ -617,14 +480,5 @@ mod app {
     extern "Rust" {
         #[task(local = [state2], shared = [led],priority = 1)]
         async fn blink2(cx: blink2::Context);
-    }
-
-    #[task(shared = [usb_cdc],priority = 2)]
-    async fn cdc_receiver(mut ctx: cdc_receiver::Context, mut receiver: Receiver<'static, SerialMessage, CDC_BUFF_CAPACITY>) {
-        while let Ok(message) = receiver.recv().await {
-            ctx.shared.usb_cdc.lock(|cdc| {
-                cdc.write(&finish_message(message)).unwrap();
-            });
-        }
     }
 }

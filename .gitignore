@@ -35,4 +35,5 @@ cmake-*
 
 # Added by cargo
 
-/target
+*target*
+test_ckp/target/*
